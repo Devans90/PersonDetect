@@ -25,36 +25,80 @@ class ROI(BaseModel):
     color_bgr: Tuple[int, int, int] = (255, 200, 100)  # default color (light blue)
 
 # Define your ROIs in normalized coordinates
-# Example: top_left=(0.1, 0.1) means 10% from the left, 10% from the top, etc.
-# Assign unique BGR colors to each stand so you can differentiate them visually.
 rois = [
     ROI(name="Stand 1",
-        top_left=(0.05, 0.05),
-        bottom_right=(0.30, 0.80),
+        top_left=(0.1, 0.05),
+        bottom_right=(0.30, 0.60),
         color_bgr=(255, 200, 100)),  # Light blue
     ROI(name="Stand 2",
-        top_left=(0.3, 0.05),
-        bottom_right=(0.80, 0.60),
+        top_left=(0.4, 0.05),
+        bottom_right=(0.80, 0.40),
         color_bgr=(100, 200, 255)),  # Light orange-ish
     # Add more stands as needed, with unique colors
 ]
 
+# Overlap threshold (i.e., require at least 30% overlap between
+# the person's bounding box and the ROI to consider them "in" the stand)
+OVERLAP_THRESHOLD = 0.3
 
 # ---------------------------
 # 2. Initialize Model
 # ---------------------------
 
-model = YOLO('yolo11n.pt')  
-# You can play around with confidence threshold, iou threshold, etc.:
+model = YOLO('yolo11n.pt')  # or your chosen YOLO version
+# You can play around with model parameters, e.g.:
 # results = model(frame, conf=0.25, iou=0.45)
 
 # ---------------------------
-# 3. Video Capture
+# 3. Define helper functions
+# ---------------------------
+
+def compute_intersection_area(boxA, boxB):
+    """
+    Compute the intersection area between two bounding boxes.
+    boxA and boxB are each in (x1, y1, x2, y2) format (pixel coords).
+    """
+    x1A, y1A, x2A, y2A = boxA
+    x1B, y1B, x2B, y2B = boxB
+
+    # Calculate overlap area
+    inter_x1 = max(x1A, x1B)
+    inter_y1 = max(y1A, y1B)
+    inter_x2 = min(x2A, x2B)
+    inter_y2 = min(y2A, y2B)
+
+    if inter_x2 < inter_x1 or inter_y2 < inter_y1:
+        return 0  # No overlap
+
+    return (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+
+def compute_area(box):
+    """Compute area of a bounding box in (x1, y1, x2, y2) format."""
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+def smooth_data(data_list, window_size=5):
+    """
+    Simple moving average smoothing for 1D data.
+    data_list: list of values
+    window_size: number of frames to average
+    Returns a new list of the same length, smoothed by the window.
+    """
+    smoothed = []
+    for i in range(len(data_list)):
+        start = max(0, i - window_size + 1)
+        window = data_list[start:i+1]
+        smoothed.append(sum(window) / len(window))
+    return smoothed
+
+# ---------------------------
+# 4. Video Capture
 # ---------------------------
 
 cap = cv2.VideoCapture('cctv_footage.mp4')
 
-# (Optional) Store historical data for time-series plotting:
+# We store historical data for time-series:
+# Each entry will track "frame", each stand's count, and "Outside".
 timeline_data = []
 
 frame_index = 0
@@ -71,17 +115,14 @@ while cap.isOpened():
     for roi in rois:
         roi.frame_attention_count = 0
 
-    # -------------------------------------------
-    # 3A. Predict with YOLO (person detection)
-    # -------------------------------------------
+    # We'll track how many people were not in any stand for this frame
+    outside_count = 0
+
+    # 1) Predict with YOLO (person detection)
     results = model(frame)
 
-    # Prepare an overlay copy for semi-transparent ROI rectangles
+    # 2) Prepare an overlay copy for semi-transparent ROI rectangles
     overlay = frame.copy()
-
-    # -------------------------------------------
-    # 3B. Draw semi-transparent overlays for each stand ROI
-    # -------------------------------------------
     for roi in rois:
         roi_x1 = int(roi.top_left[0] * width)
         roi_y1 = int(roi.top_left[1] * height)
@@ -104,7 +145,7 @@ while cap.isOpened():
             (roi_x1, roi_y1 - 5),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (255, 255, 255),  # Text color (white)
+            (255, 255, 255),  # White text
             2
         )
 
@@ -112,74 +153,73 @@ while cap.isOpened():
     alpha = 0.3
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-    # -------------------------------------------
-    # 3C. Check each detection and draw bounding box
-    # -------------------------------------------
-    # We'll store the bounding box color logic:
-    # - Green if in no ROI
-    # - ROI color if in exactly one ROI
-    # - Red if in multiple ROIs
-    results = model(frame)
+    # 3) Analyze detections
     for result in results:
         if hasattr(result, 'boxes') and result.boxes is not None:
             for box in result.boxes:
                 cls = int(box.cls[0])  # Class ID
-                if cls == 0:  # Class 0 is 'person' in COCO
+                if cls == 0:  # "person" in COCO
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    person_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    person_box = (x1, y1, x2, y2)
 
-                    # Determine which ROIs this person is in
+                    # We'll check overlap with each ROI
                     rois_in = []
-                    for roi in rois:
-                        roi_x1 = int(roi.top_left[0] * width)
-                        roi_y1 = int(roi.top_left[1] * height)
-                        roi_x2 = int(roi.bottom_right[0] * width)
-                        roi_y2 = int(roi.bottom_right[1] * height)
+                    person_area = compute_area(person_box)
 
-                        if (roi_x1 <= person_center[0] <= roi_x2 and
-                                roi_y1 <= person_center[1] <= roi_y2):
+                    # Avoid division by zero if box is degenerate
+                    if person_area <= 0:
+                        continue
+
+                    for roi in rois:
+                        rx1 = int(roi.top_left[0] * width)
+                        ry1 = int(roi.top_left[1] * height)
+                        rx2 = int(roi.bottom_right[0] * width)
+                        ry2 = int(roi.bottom_right[1] * height)
+                        roi_box = (rx1, ry1, rx2, ry2)
+
+                        inter_area = compute_intersection_area(person_box, roi_box)
+                        overlap_ratio = inter_area / float(person_area)
+
+                        if overlap_ratio >= OVERLAP_THRESHOLD:
                             rois_in.append(roi)
 
-                    # Choose bounding box color based on how many stands the person is in
+                    # Determine bounding box color
                     if len(rois_in) == 0:
-                        # Not in any stand
+                        # Person is not in any stand
                         box_color = (0, 255, 0)  # Green
+                        outside_count += 1
                     elif len(rois_in) == 1:
-                        # In exactly one ROI => use that ROI's color
+                        # Exactly one ROI
                         box_color = rois_in[0].color_bgr
-                        # Increment the ROI's counters
                         rois_in[0].frame_attention_count += 1
                         rois_in[0].total_attention_count += 1
                     else:
-                        # In multiple ROIs => red bounding box
+                        # In multiple stands => red bounding box
                         box_color = (0, 0, 255)
-                        # If you want to increment counters for all, you can do so:
-                        for r in rois_in:
-                            r.frame_attention_count += 1
-                            r.total_attention_count += 1
+                        for roi_in_multiple in rois_in:
+                            roi_in_multiple.frame_attention_count += 1
+                            roi_in_multiple.total_attention_count += 1
 
-                    # Draw the bounding box
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1),
-                        (x2, y2),
-                        box_color,
-                        2
-                    )
+                    # Draw bounding box on frame
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
 
-    # -----------------------------------------------------
-    # 3D. (Optional) Show the per-frame ROI counts
-    # -----------------------------------------------------
+    # 4) Show the per-frame counts for each stand
     y_offset = 30
     for roi in rois:
         text = f"{roi.name}: {roi.frame_attention_count} in this frame"
         cv2.putText(frame, text, (10, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         y_offset += 20
+    
+    # Also display how many are outside
+    outside_text = f"Outside: {outside_count} in this frame"
+    cv2.putText(frame, outside_text, (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-    # Collect timeline data (for each ROI, how many were detected)
-    timeline_row = {roi.name: roi.frame_attention_count for roi in rois}
-    timeline_row["frame"] = frame_index
+    # Collect data for time-series
+    timeline_row = {"frame": frame_index, "Outside": outside_count}
+    for roi in rois:
+        timeline_row[roi.name] = roi.frame_attention_count
     timeline_data.append(timeline_row)
 
     # Show the video with overlays
@@ -191,31 +231,39 @@ cap.release()
 cv2.destroyAllWindows()
 
 # ---------------------------
-# 4. Summarize Results
+# 5. Summarize Results
 # ---------------------------
 print("Attention analysis results:")
 for roi in rois:
     print(f"{roi.name} received {roi.total_attention_count} total attention counts.")
 
 # ---------------------------
-# 5. Generate Graphs
+# 6. Generate Smoothed Time-Series Graphs
 # ---------------------------
-# Let's create a simple time-series of how many persons per frame for each ROI.
 
 frames = [row["frame"] for row in timeline_data]
 
+# For each ROI + "Outside," we build a smoothed series and plot it
 plt.figure(figsize=(10, 6))
-for roi in rois:
-    counts_per_frame = [row[roi.name] for row in timeline_data]
-    plt.plot(frames, counts_per_frame, label=roi.name)
 
-plt.title("Number of People in Each ROI by Frame")
+# Plot "Outside"
+raw_outside = [row["Outside"] for row in timeline_data]
+smooth_outside = smooth_data(raw_outside, window_size=5)
+plt.plot(frames, smooth_outside, label="Outside")
+
+# Plot each ROI
+for roi in rois:
+    raw_counts = [row[roi.name] for row in timeline_data]
+    smooth_counts = smooth_data(raw_counts, window_size=5)
+    plt.plot(frames, smooth_counts, label=roi.name)
+
+plt.title("Smoothed Number of People by Frame (5-frame moving average)")
 plt.xlabel("Frame")
 plt.ylabel("People Count")
 plt.legend()
 plt.show()
 
-# Alternatively, you might want a simple bar chart of total attention:
+# Alternatively, a bar chart of total attention (ROI only):
 plt.figure(figsize=(6,4))
 roi_names = [r.name for r in rois]
 roi_totals = [r.total_attention_count for r in rois]
