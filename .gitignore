@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+yolo11l.pt
+yolo11n.pt
+yolo11x.pt
+yolov5s.pt
